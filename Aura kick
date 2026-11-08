@@ -1,0 +1,604 @@
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+local CoreGui           = game:GetService("CoreGui")
+local Stats             = game:GetService("Stats")
+
+local LP = Players.LocalPlayer
+
+local ICON_ID = "rbxassetid://76554028222371"
+
+if game.PlaceId ~= 6961824067 then
+    return warn("[KickGrab Aura] เกมไม่รองรับ")
+end
+
+local GrabEvents = ReplicatedStorage:WaitForChild("GrabEvents", 10)
+if not GrabEvents then return warn("[KickGrab Aura] ไม่พบ GrabEvents") end
+
+local SNO         = GrabEvents:WaitForChild("SetNetworkOwner", 5)
+local DestroyLine = GrabEvents:WaitForChild("DestroyGrabLine", 5)
+if not SNO or not DestroyLine then return warn("[KickGrab Aura] ไม่พบ remotes") end
+
+local Config = {
+    Enabled       = false,
+    Range         = 100,
+    HeightOffset  = 20,
+    KillRange     = 33,
+    CircleRadius  = 15,
+    PullStrength  = 50000,
+    MaxTargets    = 24,
+
+    SNOInterval     = 0.50,
+    DestroyInterval = 0.12,
+    BaseInterval    = 0.03,
+    StaggerWindow   = 0.50,
+    GlobalRateCap   = 350,
+}
+
+local State = {
+    Targets       = {},
+    ActiveTargets = {},
+    Running       = false,
+    GlobalRateCnt = 0,
+    CurrentPing   = 0,
+    LagMode       = "Normal",
+}
+
+local V3 = Vector3.new
+local CF = CFrame.new
+
+local function getChar(player)
+    player = player or LP
+    local ch = player.Character
+    if not ch then return nil, nil, nil end
+    return ch, ch:FindFirstChild("HumanoidRootPart"), ch:FindFirstChild("Humanoid")
+end
+
+local function mag(a, b)
+    if not a or not b then return math.huge end
+    return (a.Position - b.Position).Magnitude
+end
+
+local function canFire()
+    return State.GlobalRateCnt < State.GlobalRateCap
+end
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        State.GlobalRateCnt = 0
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(2)
+        local ok, ping = pcall(function()
+            return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+        end)
+        if ok then
+            State.CurrentPing = ping
+            if ping > 400 then
+                State.LagMode = "Frozen"
+                State.GlobalRateCap = 100
+            elseif ping > 200 then
+                State.LagMode = "Slow"
+                State.GlobalRateCap = 220
+            else
+                State.LagMode = "Normal"
+                State.GlobalRateCap = 350
+            end
+        end
+    end
+end)
+
+local function computeOffset(slotIndex, total)
+    if total <= 1 then return V3(0, Config.HeightOffset, 0) end
+    local angle = (slotIndex - 1) / total * math.pi * 2
+    return V3(
+        math.cos(angle) * Config.CircleRadius,
+        Config.HeightOffset,
+        math.sin(angle) * Config.CircleRadius
+    )
+end
+
+local function findSlot(target)
+    for i = 1, #State.ActiveTargets do
+        if State.ActiveTargets[i] == target then return i end
+    end
+    return nil
+end
+
+local function removeSlot(target)
+    for i = #State.ActiveTargets, 1, -1 do
+        if State.ActiveTargets[i] == target then
+            table.remove(State.ActiveTargets, i)
+            return
+        end
+    end
+end
+
+local function cleanupPlayer(hrp)
+    if not hrp or not hrp.Parent then return end
+    local bp = hrp:FindFirstChild("KickHoldBP")
+    local bg = hrp:FindFirstChild("KickHoldBG")
+    if bp then pcall(function() bp:Destroy() end) end
+    if bg then pcall(function() bg:Destroy() end) end
+    pcall(function() DestroyLine:FireServer(hrp) end)
+end
+
+local function addTarget(player)
+    if player == LP or State.Targets[player] then return end
+    if #State.ActiveTargets >= Config.MaxTargets then return end
+
+    local tChar, tHRP, tHum = getChar(player)
+    if not (tChar and tHRP and tHum) then return end
+    if tHum.Health <= 0 then return end
+    if tHRP:FindFirstChild("KickHoldBP") then return end
+
+    local bp = Instance.new("BodyPosition")
+    bp.Name     = "KickHoldBP"
+    bp.MaxForce = V3(math.huge, math.huge, math.huge)
+    bp.P           = Config.PullStrength
+    bp.D           = 100
+    bp.Position    = tHRP.Position
+    bp.Parent      = tHRP
+
+    local bg = Instance.new("BodyGyro")
+    bg.Name      = "KickHoldBG"
+    bg.MaxTorque = V3(math.huge, math.huge, math.huge)
+    bg.P           = 50000
+    bg.D           = 100
+    bg.CFrame      = tHRP.CFrame
+    bg.Parent      = tHRP
+
+    pcall(function()
+        for _, p in ipairs(tChar:QueryDescendants("BasePart")) do
+            p.CanCollide = false
+        end
+    end)
+
+    local idx = #State.ActiveTargets + 1
+    local stagger = ((idx - 1) % 24) / 24 * Config.StaggerWindow
+
+    State.Targets[player] = {
+        BP           = bp,
+        BG           = bg,
+        HRP          = tHRP,
+        NextSNO      = tick() + stagger,
+        NextDestroy  = tick() + stagger + 0.06,
+    }
+
+    table.insert(State.ActiveTargets, player)
+end
+
+local function removeTarget(player)
+    local state = State.Targets[player]
+    if not state then return end
+
+    if state.BP and state.BP.Parent then pcall(state.BP.Destroy, state.BP) end
+    if state.BG and state.BG.Parent then pcall(state.BG.Destroy, state.BG) end
+    if state.HRP and state.HRP.Parent then
+        pcall(function() DestroyLine:FireServer(state.HRP) end)
+    end
+
+    State.Targets[player] = nil
+    removeSlot(player)
+end
+
+local function updateTarget(player, state, lpHRP)
+    local tChar, tHRP, tHum = getChar(player)
+    if not (tChar and tHRP and tHum) then return false end
+    if tHum.Health <= 0 then return false end
+
+    local dist = mag(lpHRP, tHRP)
+    if dist > Config.Range then return false end
+
+    local slot = findSlot(player)
+    if slot and state.BP.Parent then
+        state.BP.Position = lpHRP.Position + computeOffset(slot, #State.ActiveTargets)
+        if dist > 40 then
+            state.BP.P = math.min(Config.PullStrength * 3, 500000)
+        else
+            state.BP.P = Config.PullStrength
+        end
+    end
+
+    local now = tick()
+
+    if now >= state.NextSNO then
+        if canFire() then
+            pcall(function() SNO:FireServer(tHRP, tHRP.CFrame) end)
+            State.GlobalRateCnt += 1
+        end
+        state.NextSNO = now + Config.SNOInterval
+    end
+
+    if dist <= Config.KillRange and now >= state.NextDestroy then
+        if canFire() then
+            pcall(function() DestroyLine:FireServer(tHRP) end)
+            State.GlobalRateCnt += 1
+        end
+        state.NextDestroy = now + Config.DestroyInterval
+    end
+
+    return true
+end
+
+local function startAura()
+    if State.Running then return end
+    State.Running = true
+
+    task.spawn(function()
+        while Config.Enabled do
+            local _, lpHRP = getChar()
+
+            if lpHRP then
+                for p in pairs(State.Targets) do
+                    local ch = p.Character
+                    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+                    local hum = ch and ch:FindFirstChild("Humanoid")
+                    if not hrp or not hum or hum.Health <= 0 or not p.Parent then
+                        removeTarget(p)
+                    end
+                end
+
+                if #State.ActiveTargets < Config.MaxTargets then
+                    local candidates = {}
+
+                    for _, p in ipairs(Players:GetPlayers()) do
+                        if p ~= LP and not State.Targets[p] then
+                            local _, tHRP, tHum = getChar(p)
+                            if tHRP and tHum and tHum.Health > 0 then
+                                local d = mag(lpHRP, tHRP)
+                                if d <= Config.Range then
+                                    table.insert(candidates, { plr = p, dist = d })
+                                end
+                            end
+                        end
+                    end
+
+                    table.sort(candidates, function(a, b) return a.dist < b.dist end)
+
+                    for _, c in ipairs(candidates) do
+                        if #State.ActiveTargets >= Config.MaxTargets then break end
+                        addTarget(c.plr)
+                    end
+                end
+
+                for p, state in pairs(State.Targets) do
+                    if not updateTarget(p, state, lpHRP) then
+                        if not p.Character or not p.Character:FindFirstChild("HumanoidRootPart") then
+                            removeTarget(p)
+                        end
+                    end
+                end
+            end
+
+            task.wait(Config.BaseInterval)
+        end
+
+        State.Running = false
+    end)
+end
+
+local function stopAura()
+    Config.Enabled = false
+    State.Running = false
+
+    for p in pairs(State.Targets) do
+        removeTarget(p)
+    end
+
+    table.clear(State.Targets)
+    table.clear(State.ActiveTargets)
+end
+
+local Colors = {
+    BG     = Color3.fromRGB(20, 20, 25),
+    Accent = Color3.fromRGB(255, 200, 0),
+    Text   = Color3.fromRGB(240, 240, 240),
+    Sub    = Color3.fromRGB(150, 150, 160),
+    Green  = Color3.fromRGB(80, 220, 120),
+    Red    = Color3.fromRGB(230, 80, 80),
+    Orange = Color3.fromRGB(255, 140, 60),
+}
+
+local function corner(inst, r)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, r or 6)
+    c.Parent = inst
+    return c
+end
+
+local function stroke(inst, col, thick)
+    local s = Instance.new("UIStroke")
+    s.Color = col or Colors.Accent
+    s.Thickness = thick or 1
+    s.Parent = inst
+    return s
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "KickGrabAuraUI"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder = 100
+
+local parented = pcall(function() gui.Parent = CoreGui end)
+if not parented or not gui.Parent then
+    gui.Parent = LP:WaitForChild("PlayerGui")
+end
+
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(240, 410)
+main.Position = UDim2.new(0, 20, 0.5, -205)
+main.BackgroundColor3 = Colors.BG
+main.BorderSizePixel = 0
+main.Active = true
+main.Draggable = true
+main.Parent = gui
+corner(main, 8)
+stroke(main, Colors.Accent, 1.5)
+
+local topBar = Instance.new("Frame")
+topBar.Size = UDim2.new(1, 0, 0, 3)
+topBar.BackgroundColor3 = Colors.Accent
+topBar.BorderSizePixel = 0
+topBar.Parent = main
+corner(topBar, 3)
+
+local iconFrame = Instance.new("Frame")
+iconFrame.Size = UDim2.fromOffset(28, 28)
+iconFrame.Position = UDim2.fromOffset(8, 9)
+iconFrame.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
+iconFrame.BorderSizePixel = 0
+iconFrame.Parent = main
+corner(iconFrame, 6)
+stroke(iconFrame, Colors.Accent, 1)
+
+local iconImage = Instance.new("ImageLabel")
+iconImage.Size = UDim2.new(1, -4, 1, -4)
+iconImage.Position = UDim2.fromOffset(2, 2)
+iconImage.BackgroundTransparency = 1
+iconImage.Image = ICON_ID
+iconImage.ScaleType = Enum.ScaleType.Fit
+iconImage.Parent = iconFrame
+corner(iconImage, 4)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -50, 0, 28)
+title.Position = UDim2.fromOffset(42, 10)
+title.BackgroundTransparency = 1
+title.Text = "KICK GRAB AURA"
+title.TextColor3 = Colors.Accent
+title.Font = Enum.Font.GothamBold
+title.TextSize = 13
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = main
+
+local verLabel = Instance.new("TextLabel")
+verLabel.Size = UDim2.new(0, 40, 0, 12)
+verLabel.Position = UDim2.fromOffset(190, 14)
+verLabel.BackgroundTransparency = 1
+verLabel.Text = "v2.1"
+verLabel.TextColor3 = Colors.Sub
+verLabel.Font = Enum.Font.Code
+verLabel.TextSize = 10
+verLabel.TextXAlignment = Enum.TextXAlignment.Right
+verLabel.Parent = main
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -20, 0, 18)
+status.Position = UDim2.fromOffset(10, 40)
+status.BackgroundTransparency = 1
+status.Text = "● OFF  |  targets: 0/24"
+status.TextColor3 = Colors.Red
+status.Font = Enum.Font.Code
+status.TextSize = 12
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.Parent = main
+
+local pingLabel = Instance.new("TextLabel")
+pingLabel.Size = UDim2.new(1, -20, 0, 16)
+pingLabel.Position = UDim2.fromOffset(10, 58)
+pingLabel.BackgroundTransparency = 1
+pingLabel.Text = "ping: -- ms  |  mode: Normal"
+pingLabel.TextColor3 = Colors.Sub
+pingLabel.Font = Enum.Font.Code
+pingLabel.TextSize = 11
+pingLabel.TextXAlignment = Enum.TextXAlignment.Left
+pingLabel.Parent = main
+
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size = UDim2.new(1, -20, 0, 36)
+toggleBtn.Position = UDim2.fromOffset(10, 80)
+toggleBtn.BackgroundColor3 = Colors.Red
+toggleBtn.Text = "ENABLE"
+toggleBtn.TextColor3 = Color3.new(1, 1, 1)
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.TextSize = 15
+toggleBtn.AutoButtonColor = false
+toggleBtn.Parent = main
+corner(toggleBtn, 6)
+stroke(toggleBtn, Color3.new(1, 1, 1), 1)
+
+local function makeSlider(yPos, label, min, max, default, suffix, onChange, step)
+    step = step or 1
+    local holder = Instance.new("Frame")
+    holder.Size = UDim2.new(1, -20, 0, 32)
+    holder.Position = UDim2.fromOffset(10, yPos)
+    holder.BackgroundTransparency = 1
+    holder.Parent = main
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 0, 14)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = label .. ": " .. string.format("%.1f", default) .. (suffix or "")
+    lbl.TextColor3 = Colors.Sub
+    lbl.Font = Enum.Font.Code
+    lbl.TextSize = 11
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = holder
+
+    local bar = Instance.new("TextButton")
+    bar.Size = UDim2.new(1, 0, 0, 10)
+    bar.Position = UDim2.fromOffset(0, 18)
+    bar.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    bar.Text = ""
+    bar.AutoButtonColor = false
+    bar.Parent = holder
+    corner(bar, 5)
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.fromScale((default - min) / (max - min), 1)
+    fill.BackgroundColor3 = Colors.Accent
+    fill.BorderSizePixel = 0
+    fill.Parent = bar
+    corner(fill, 5)
+
+    local dragging = false
+    local function update(input)
+        local abs = bar.AbsolutePosition.X
+        local size = bar.AbsoluteSize.X
+        if size <= 0 then return end
+        local pct = math.clamp((input.Position.X - abs) / size, 0, 1)
+        fill.Size = UDim2.fromScale(pct, 1)
+        local val = min + (max - min) * pct
+        val = math.floor(val / step + 0.5) * step
+        lbl.Text = label .. ": " .. string.format("%.1f", val) .. (suffix or "")
+        onChange(val)
+    end
+
+    bar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            update(input)
+        end
+    end)
+    bar.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            update(input)
+        end
+    end)
+end
+
+makeSlider(124, "Aura Range",     10, 300, Config.Range,        " studs", function(v) Config.Range        = v end, 5)
+makeSlider(162, "Circle Radius",   3,  40, Config.CircleRadius, " studs", function(v) Config.CircleRadius = v end, 1)
+makeSlider(200, "Height Offset",   5,  60, Config.HeightOffset, " Y",     function(v) Config.HeightOffset = v end, 1)
+makeSlider(238, "Kill Range",     20,  50, Config.KillRange,    " studs", function(v) Config.KillRange    = v end, 1)
+makeSlider(276, "Pull Strength", 10000, 200000, Config.PullStrength, "",  function(v) Config.PullStrength = v end, 5000)
+makeSlider(314, "Max Targets",     1,  24, Config.MaxTargets,   " plr",   function(v) Config.MaxTargets   = math.floor(v) end, 1)
+
+local infoLabel = Instance.new("TextLabel")
+infoLabel.Size = UDim2.new(1, -20, 0, 52)
+infoLabel.Position = UDim2.fromOffset(10, 352)
+infoLabel.BackgroundTransparency = 1
+infoLabel.Text = ""
+infoLabel.TextColor3 = Colors.Sub
+infoLabel.Font = Enum.Font.Code
+infoLabel.TextSize = 10
+infoLabel.TextWrapped = true
+infoLabel.TextXAlignment = Enum.TextXAlignment.Left
+infoLabel.TextYAlignment = Enum.TextYAlignment.Top
+infoLabel.Parent = main
+
+local hoverTween = nil
+
+toggleBtn.MouseButton1Click:Connect(function()
+    Config.Enabled = not Config.Enabled
+    if hoverTween then hoverTween:Cancel() end
+
+    if Config.Enabled then
+        toggleBtn.Text = "DISABLE"
+        toggleBtn.BackgroundColor3 = Colors.Green
+        status.TextColor3 = Colors.Green
+        startAura()
+    else
+        toggleBtn.Text = "ENABLE"
+        toggleBtn.BackgroundColor3 = Colors.Red
+        status.TextColor3 = Colors.Red
+        stopAura()
+    end
+end)
+
+toggleBtn.MouseEnter:Connect(function()
+    hoverTween = TweenService:Create(toggleBtn, TweenInfo.new(0.15), {
+        BackgroundColor3 = Config.Enabled and Color3.fromRGB(100, 240, 140) or Color3.fromRGB(255, 100, 100)
+    })
+    hoverTween:Play()
+end)
+toggleBtn.MouseLeave:Connect(function()
+    if hoverTween then hoverTween:Cancel() end
+    toggleBtn.BackgroundColor3 = Config.Enabled and Colors.Green or Colors.Red
+end)
+
+RunService.Heartbeat:Connect(function()
+    local count = #State.ActiveTargets
+    local txt
+
+    if Config.Enabled then
+        local circle = count >= 2 and "  ⭕" or ""
+        txt = string.format("● ON   |  targets: %d/%d%s", count, Config.MaxTargets, circle)
+    else
+        txt = string.format("● OFF  |  targets: %d/%d", count, Config.MaxTargets)
+    end
+
+    if status.Text ~= txt then status.Text = txt end
+
+    local pTxt = string.format("ping: %d ms  |  mode: %s  |  rate: %d/s",
+        math.floor(State.CurrentPing), State.LagMode, State.GlobalRateCnt)
+    if pingLabel.Text ~= pTxt then
+        pingLabel.Text = pTxt
+        if State.LagMode == "Frozen" then
+            pingLabel.TextColor3 = Colors.Red
+        elseif State.LagMode == "Slow" then
+            pingLabel.TextColor3 = Colors.Orange
+        else
+            pingLabel.TextColor3 = Colors.Sub
+        end
+    end
+
+    local info, col
+    if count >= 20 then
+        info = string.format("🔥 FULL SERVER MODE (%d targets)", count)
+        col = Colors.Orange
+    elseif State.LagMode == "Frozen" then
+        info = "⚠ ปิงสูงมาก — ชะลออัตโนมัติ"
+        col = Colors.Red
+    elseif Config.Range > Config.KillRange then
+        info = string.format("Range (%d) > Kill (%d): ดึงไม่ spam, kick ตอนใกล้", Config.Range, Config.KillRange)
+        col = Colors.Sub
+    else
+        info = string.format("✓ Optimal (Range %d ≤ Kill %d)", Config.Range, Config.KillRange)
+        col = Colors.Green
+    end
+
+    if infoLabel.Text ~= info then
+        infoLabel.Text = info
+        infoLabel.TextColor3 = col
+    end
+end)
+
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if input.KeyCode == Enum.KeyCode.RightControl then
+        toggleBtn:Fire("MouseButton1Click")
+    end
+end)
+
+LP.CharacterAdded:Connect(function()
+    if Config.Enabled then
+        task.wait(1)
+        stopAura()
+        Config.Enabled = true
+        startAura()
+    end
+end)
